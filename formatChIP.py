@@ -5,9 +5,12 @@ import sys
 import pandas as pd
 from pathlib import Path
 
-path=Path(sys.argv[1])
-in_file = path / sys.argv[2]
-out_file = path / sys.argv[3]
+# path=Path(sys.argv[1])
+# in_file = path / sys.argv[2]
+# out_file = path / sys.argv[3]
+
+in_file = Path(sys.argv[1])
+out_file = Path(sys.argv[2])
 
 df = pd.read_csv(in_file)
 df = df.iloc[:, 1:]
