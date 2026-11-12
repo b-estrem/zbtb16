@@ -1,66 +1,77 @@
 #!/bin/bash
 
-#SBATCH -p short
+#SBATCH -p long
 #SBATCH -J CutTag
 #SBATCH -e zjob-mapCutTag_%j.error
 #SBATCH -o zjob-mapCutTag_%j.out
 #SBATCH --nodes=1
-#SBATCH -c 4
-#SBATCH --time=2:00:00
+#SBATCH -c 64
+#SBATCH --time=10:00:00
 t=$SLURM_CPUS_PER_TASK
 
-tmp=~/hpctmp/brandon.estrem/cutTag
 raw=/home/brandon.estrem/szabo/brandon_estrem/03.zbtb16_mouse/analysis/raw_data/cuttag_20260810
-dm6=/home/brandon.estrem/szabo/brandon_estrem/db/dm6
-mm9=/primary/vari/genomicdata/genomes/mm9/bowtie2
+tmp=~/hpctmp/brandon.estrem/cutTag
 db=~/szabo/brandon_estrem/db
-nonB=/home/brandon.estrem/szabo/brandon_estrem/db/mm9/nonB
+mm10=/primary/vari/genomicdata/genomes/mm10
+hybrid=$db/hybrid_mm10_dm6
+out=/home/brandon.estrem/szabo/brandon_estrem/03.zbtb16_mouse/analysis/output/cutTag
 
-name=BE_mm_CUTTag_WT_A_G4_070126
+#################################################
+##### Things that only need to be run once
+## Make concatenated genome - better than mapping to each genome individually
+cp /primary/vari/genomicdata/genomes/dm6/dm6.fa $db
+## prefix spike-in chromosomes so they can be separated later
+sed 's/^>/>dm_/' /primary/vari/genomicdata/genomes/dm6/dm6.fa > $hybrid/dm6_prefixed.fa
+cat $mm10/mm10.fa $hybrid/dm6_prefixed.fa > $hybrid/hybrid_mm10_dm6.fa
+bowtie2-build --threads 16 $hybrid/hybrid_mm10_dm6.fa $hybrid/hybrid_mm10_dm6
+
+## Make libStats file with header
+echo -e "name\tfastq\tmm10_reads\tdm6_reads" > libStats.tsv
 
 #################################################
 ##### Trim and QC of data
 module load bbc2/fastqc/fastqc-0.12.1 bbc2/Trimmomatic/trimmomatic-0.39
 
-## Check each step output and see how many reads lost, determine rm or keep dups
-for name in BE_mm_CUTTag_WT_A_G4_070126 BE_mm_CUTTag_WT_A_H3K4me3_070126
+for name in $raw/$name.R1.fq.gz
 do
-    # fastqc $raw/$name.R1.fq.gz
+    fastqc $raw/$name.R1.fq.gz
 
-    # java -jar $TRIMM PE -phred33 -threads $t $raw/$name.R1.fq.gz $raw/$name.R2.fq.gz -baseout $tmp/$name.trimmed.fq.gz ILLUMINACLIP:$db/NexteraPE-PE.fa:3:30:10:3:True MINLEN:20
-    # fastqc $tmp/$name.trimmed_1P.fq.gz
+    java -jar $TRIMM PE -phred33 -threads $t $raw/$name.R1.fq.gz $raw/$name.R2.fq.gz -baseout $tmp/$name.trimmed.fq.gz ILLUMINACLIP:$db/NexteraPE-PE.fa:3:30:10:3:True MINLEN:20
+    fastqc $tmp/$name.trimmed_1P.fq.gz
 
-    ## Map to Drosophila Genome for normalization
-    ## test # of reads that map to both genomes - need to estimate library size?
-    bowtie2 -p $t -x $dm6/dm6 -1 $tmp/$name.trimmed_1P.fq.gz -2 $tmp/$name.trimmed_2P.fq.gz -S $out/$name.dm6.sam --end-to-end --very-sensitive --nounal --no-mixed --no-discordant -I 10 -X 700
-
-    bowtie2 -p $t -x $mm9/mm9 -1 $tmp/$name.trimmed_1P.fq.gz -2 $tmp/$name.trimmed_2P.fq.gz -S $out/$name.sam --end-to-end --very-sensitive --nounal --no-mixed --no-discordant -I 10 -X 700
+    ## Map to hybrid genome for normalization
+    echo "$name" >&2
+    bowtie2 -p $t -x $hybrid/hybrid_mm10_dm6 -1 $tmp/$name.trimmed_1P.fq.gz -2 $tmp/$name.trimmed_2P.fq.gz -S $out/bam/$name.hybrid.sam --end-to-end --very-sensitive --no-unal --no-mixed --no-discordant -I 10 -X 700
     
-    samtools view -@ $t -bf 3 -q 30 $out/$name.sam | samtools sort -@ $t - -o $out/$name.bam
+    samtools view -@ $t -bf 3 -q 30 $out/bam/$name.hybrid.sam | samtools sort -@ $t - -o $out/bam/$name.hybrid.bam
+    samtools index -@ $t $out/bam/$name.hybrid.bam
+    rm $out/bam/$name.hybrid.sam
+    
+    ## Remove dm6 reads, leaving behind mm10 mapped reads
+    chroms=$(samtools idxstats $out/bam/$name.hybrid.bam | cut -f1 | grep -v -e '^dm_' -e '^\*$')
+    samtools view -@ $t -b $out/bam/$name.hybrid.bam $chroms > $out/bam/$name.mm10.bam
+    samtools index $out/bam/$name.mm10.bam
 
-    module load bbc2/picard/picard-3.0.0
-    java -Xms8g -Xmx16g -jar $PICARD MarkDuplicates \
-        -I $out/$name.bam \
-        -O $out/$name.noDup.bam \
-        -M $out/$name.duplicates.txt \
-        --REMOVE_DUPLICATES true \
-        --QUIET true \
-        --VERBOSITY WARNING
-    samtools index -@ $t $out/$name.bam
+    ## Calculate normalization by spike in
+    dm_reads=$(samtools idxstats $out/bam/$name.hybrid.bam | awk '$1 ~ /^dm_/ {n+=$3} END{print n}')
+    mm10_reads=$(samtools idxstats $out/bam/$name.hybrid.bam | awk '$1 !~ /^dm_/ && $1!="*" {n+=$3} END{print n}')
+    norm_dm6="$(echo "scale=3; 10000/$reads" | bc)"
+    
+    ## Calculate normalization to 10M reads 
+    reads="$(samtools view -c $out/bam/$name.mm10.bam)"
+    norm="$(echo "scale=3; 10000000/$reads" | bc)"
 
-    ## Normalize by reads
-
-    ## Normalize by spike in
-
-    ## Make bg/bw file?
-
-    ## MACS/SEACR, overlap with G4
-
-    ## FRIP? other analysis?
+    ## Add read counts to file
+    lines=$(zcat "$raw/$name.R1.fq.gz" | wc -l | tr -d ' ') # Lines in a Fq file
+    fq=$(( lines / 4 * 2 )) # Find num of reads, multiply by two for num paired reads
+    echo -e "${name}\t${fq}\t${reads}\t${dm_reads}" >> libStats.tsv
+    
+    ## Make bg/bw file
+    bedtools genomecov -ibam ${out}/bam/${name}.mm10.bam -bg -scale ${norm_dm6} | sort -k1,1 -k2,2n > $out/coverage/$name.norm_dm6.bg
+    bedGraphToBigWig $out/coverage/$name.norm_dm6.bg $mm10/mm10.fa.fai $out/coverage/$name.norm_dm6.bw
+    
+    bedtools genomecov -ibam ${out}/bam/${name}.mm10.bam -bg -scale ${norm} | sort -k1,1 -k2,2n > $out/coverage/$name.norm10M.bg
+    bedGraphToBigWig $out/coverage/$name.norm10M.bg $mm10/mm10.fa.fai $out/coverage/$name.norm10M.bw
 done
+
 module unload bbc2/fastqc/fastqc-0.12.1 bbc2/Trimmomatic/trimmomatic-0.39
-
-# ## Map reads to drosophila genome for normalization
-
-# ## Map reads to mm10
-# bowtie2 --end-to-end --very-sensitive --no-unal --no-mixed --no-discordant --phred33 -I 10 -X 700
