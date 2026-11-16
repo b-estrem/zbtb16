@@ -31,39 +31,39 @@ out=/home/brandon.estrem/szabo/brandon_estrem/03.zbtb16_mouse/analysis/output/cu
 
 #################################################
 ##### Trim and QC of data
-module load bbc2/fastqc/fastqc-0.12.1 bbc2/Trimmomatic/trimmomatic-0.39
+module load bbc2/fastqc/fastqc-0.12.1 bbc2/Trimmomatic/trimmomatic-0.39 bbc2/cutadapt/cutadapt-4.3
 
-for file in $raw/BE_mm_CUTTag_WT_A_G4_070126.R1.fq.gz #$raw/*.R1.fq.gz
+for file in $raw/*.R1.fq.gz
 do
     name="$(basename -- $file .R1.fq.gz)"
+    echo "Processing $name" >&2
 
-    java -jar $TRIMM PE -phred33 -threads $t $raw/$name.R1.fq.gz $raw/$name.R2.fq.gz -baseout $tmp/$name.trimmed.fq.gz ILLUMINACLIP:$db/NexteraPE-PE.fa:2:30:10:2:True MINLEN:20
-    fastqc $tmp/$name.trimmed_1P.fq.gz
+    # java -jar $TRIMM PE -phred33 -threads $t $raw/$name.R1.fq.gz $raw/$name.R2.fq.gz -baseout $tmp/$name.trimmed.fq.gz ILLUMINACLIP:$db/NexteraPE-PE.fa:2:30:10:2:True MINLEN:20
+    echo "Trimming adapters with Cutadapt..." >&2
+    cutadapt --report=minimal -j 0 -m 20 -a CTGTCTCTTATACACATCT -A CTGTCTCTTATACACATCT -o $tmp/$name.trimmed.R1.fq.gz -p $tmp/$name.trimmed.R2.fq.gz $raw/$name.R1.fq.gz $raw/$name.R2.fq.gz
+    fastqc -q $tmp/$name.trimmed.R1.fq.gz
 
     ## Map to hybrid genome for normalization
+    echo "Mapping to hybrid genome with bowtie2..." >&2
     echo "$name" >&2
-    bowtie2 -p $t -x $hybrid/hybrid_mm10_dm6 -1 $tmp/$name.trimmed_1P.fq.gz -2 $tmp/$name.trimmed_2P.fq.gz -S $out/bam/$name.hybrid.sam --end-to-end --very-sensitive --no-unal --no-mixed --no-discordant -I 10 -X 1000
+    bowtie2 -p $t -x $hybrid/hybrid_mm10_dm6 -1 $tmp/$name.trimmed.R1.fq.gz -2 $tmp/$name.trimmed.R2.fq.gz -S $out/bam/$name.hybrid.sam --end-to-end --very-sensitive --no-unal --no-mixed --no-discordant -I 10 -X 1000
     
     samtools view -@ $t -bf 3 -q 30 $out/bam/$name.hybrid.sam | samtools sort -@ $t - -o $out/bam/$name.hybrid.bam
     samtools index -@ $t $out/bam/$name.hybrid.bam
     rm $out/bam/$name.hybrid.sam
     
     ## Remove dm6 reads, leaving behind mm10 mapped reads
+    echo "Making an mm10 only bam file..." >&2
     chroms=$(samtools idxstats $out/bam/$name.hybrid.bam | cut -f1 | grep -v -e '^dm_' -e '^\*$')
     samtools view -@ $t -b $out/bam/$name.hybrid.bam $chroms > $out/bam/$name.mm10.bam
     samtools index $out/bam/$name.mm10.bam
 
-    ## Calculate normalization by spike in
-    echo "Calculate normalization" >&2
+    ## Calculate normalization by spike in and 10M reads
+    echo "Calculating normalization factors..." >&2
     dm_reads=$(samtools idxstats $out/bam/$name.hybrid.bam | awk '$1 ~ /^dm_/ {n+=$3} END{print n}')
     mm10_reads=$(samtools idxstats $out/bam/$name.hybrid.bam | awk '$1 !~ /^dm_/ && $1!="*" {n+=$3} END{print n}')
     norm_dm6="$(echo "scale=6; 10000/$dm_reads" | bc)"
-    
-    ## Calculate normalization to 10M reads 
-    reads="$(samtools view -c $out/bam/$name.mm10.bam)"
-    norm_mm10="$(echo "scale=6; 10000000/$reads" | bc)"
-
-    echo "reads = $mm10_reads $reads" >&2
+    norm_mm10="$(echo "scale=6; 10000000/$mm10_reads" | bc)"
 
     # ## Add read counts to file
     # lines=$(zcat "$raw/$name.R1.fq.gz" | wc -l | tr -d ' ') # Lines in a Fq file
@@ -71,24 +71,24 @@ do
     # echo -e "${name}\t${fq}\t${reads}\t${dm_reads}" >> libStats.tsv
     
     ## Convert to bedpe
-    echo "Make Bam File" >&2
+    echo "Convert bam to bed file of fragments..." >&2
     samtools sort $out/bam/$name.mm10.bam -n -@ $t -o $out/bam/$name.nsort.bam 
     bedtools bamtobed -bedpe -i $out/bam/$name.nsort.bam |
     awk -v OFS='\t' '$1==$4 && $1!="." {
         s = ($2<$5) ? $2 : $5;
         e = ($3>$6) ? $3 : $6;
         print $1, s, e }' |
-    sort -k1,1 -k2,2n -k3,3n > $out/coverage/$name.bed
+    sort -k1,1 -k2,2n -k3,3n > $out/coverage/$name.frag.bed
     rm $out/bam/$name.nsort.bam 
 
     ## Make bg/bw file
-    echo "Convert to bg/bw" >&2
+    echo "Convert to normalized bw..." >&2
     if [[ $dm_reads > 100 ]]; then 
-        bedtools genomecov -i $out/coverage/$name.bed -g $mm10/mm10.fa.fai -bg -scale $norm_dm6 | sort -k1,1 -k2,2n > $out/coverage/$name.norm_dm6.bg
+        bedtools genomecov -i $out/coverage/$name.frag.bed -g $mm10/mm10.fa.fai -bg -scale $norm_dm6 | sort -k1,1 -k2,2n > $out/coverage/$name.norm_dm6.bg
         bedGraphToBigWig $out/coverage/$name.norm_dm6.bg $mm10/mm10.fa.fai $out/coverage/$name.norm_dm6.bw
     fi 
 
-    bedtools genomecov -i $out/coverage/$name.bed -g $mm10/mm10.fa.fai -bg -scale $norm_mm10 | sort -k1,1 -k2,2n > $out/coverage/$name.norm10M.bg
+    bedtools genomecov -i $out/coverage/$name.frag.bed -g $mm10/mm10.fa.fai -bg -scale $norm_mm10 | sort -k1,1 -k2,2n > $out/coverage/$name.norm10M.bg
     bedGraphToBigWig $out/coverage/$name.norm10M.bg $mm10/mm10.fa.fai $out/coverage/$name.norm10M.bw
 done
 
